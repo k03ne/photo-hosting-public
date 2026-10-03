@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.env
+.env*.local
+storage/uploads
+npm-debug.log
+Dockerfile
+docker-compose.yml
+README.md
+PROJECT_PLAN.md
+.DS_Store

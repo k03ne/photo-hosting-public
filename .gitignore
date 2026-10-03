@@ -1,0 +1,49 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# typescript build-cache (Artefakt, aendert sich bei jedem Build)
+tsconfig.tsbuildinfo
+
+# production
+/build
+
+# env — auch Sicherungskopien: `.env` matcht nur den exakten Namen, eine
+# Datei wie `.env.bak-20261003` waere sonst untracked sichtbar und ein
+# `git add -A` von einem Secret-Leak entfernt.
+.env
+.env*.local
+.env.bak*
+.env.*.bak
+*.env.backup
+
+# storage (lokale Uploads)
+/storage/uploads/*
+!/storage/uploads/.gitkeep
+
+# prisma
+# (Migrationen werden eingecheckt, nur generierter Client nicht)
+
+# werkzeug-lokal: persoenliche Permissions + evtl. fremde Skills,
+# gehoeren nicht in ein oeffentliches Repo (CLAUDE.md im Wurzelverzeichnis
+# bleibt bewusst eingecheckt)
+/.claude/
+
+# python-bytecode (falls Hilfsskripte dazukommen)
+__pycache__/
+*.pyc
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+/coverage
+
+# lokaler Spielwiesen-Ordner
+/example

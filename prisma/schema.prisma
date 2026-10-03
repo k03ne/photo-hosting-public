@@ -1,0 +1,441 @@
+// Prisma schema — Photo-Hosting Platform
+// Datenbank: PostgreSQL | Client: prisma-client-js
+//
+// Konventionen:
+// - IDs als cuid() (URL-sicher, kollisionsarm, kein Enumerieren wie bei Autoincrement)
+// - Zeitstempel überall (createdAt/updatedAt) für Sortierung & Audit
+// - Löschungen kaskadieren von Album -> Photo -> Comment/Reaction
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Admin / Auth
+// ---------------------------------------------------------------------------
+
+/// Admin-Benutzer des geschützten Backends. Für den PoC genügt ein einzelner
+/// Account; das Modell erlaubt aber problemlos mehrere.
+model Admin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  albums   Album[]
+  pages    Page[]
+  settings SiteSettings?
+}
+
+// ---------------------------------------------------------------------------
+// Album
+// ---------------------------------------------------------------------------
+
+enum AlbumLayout {
+  MASONRY   // Pinterest-artiges, höhenvariables Grid
+  GRID      // Gleichmäßiges quadratisches Raster
+  JUSTIFIED // Zeilenweise ausgerichtet (Flickr-Stil)
+}
+
+model Album {
+  id          String      @id @default(cuid())
+  title       String
+  slug        String      @unique // menschenlesbarer Pfadteil (SEO / Admin-URLs)
+  description String?
+  // Portfolio-Kategorie (Genre) des Albums, z.B. „Portraits", „Dokumentation".
+  // Nur fürs öffentliche Portfolio relevant; ohne Wirkung auf die Kundengalerie.
+  // Pro Bild via Photo.portfolioCategory überschreibbar (Mischalben).
+  category    String?
+  layout      AlbumLayout @default(MASONRY)
+  columns     Int         @default(3) // Ziel-Spaltenanzahl auf Desktop (Editor)
+  gridSpacing String      @default("REGULAR") // Bild-Abstand in der Galerie: REGULAR | LARGE
+
+  // Freigabe & Zugriffsschutz
+  // Öffentlicher, zufälliger Link-Teil. KEIN @default: der Wert kommt aus
+  // `newShareToken()` ([share-token.ts](src/lib/share-token.ts)) — 128 Bit aus
+  // dem CSPRNG. Das frühere `cuid()` war vorhersagbar genug, um bei Alben ohne
+  // Passwort den einzigen Schutz zu untergraben.
+  shareToken     String    @unique
+  readableUrl    Boolean   @default(false) // zusätzlich per lesbarem Slug erreichbar
+  isPublished    Boolean   @default(false)
+  passwordHash   String? // null = öffentlich ohne Passwort
+  passwordSetAt  DateTime?
+
+  // Cover / Key-Visual
+  coverPhotoId String? @unique
+  coverPhoto   Photo?  @relation("AlbumCover", fields: [coverPhotoId], references: [id])
+  coverBlurPx  Int     @default(0)     // Hero-Cover weichzeichnen: Radius in px (0 = aus)
+  coverOverlay Int     @default(25)    // Abdunkelung des Covers in Prozent (0-70)
+
+  // Header-Darstellung (pro Album anpassbar)
+  headerTitlePos  String  @default("CENTER") // TOP | CENTER | BOTTOM
+  headerAlign     String  @default("CENTER") // LEFT | CENTER | RIGHT
+  // Schrift-Preset des Album-Titels: SANS | SERIF | MODERN | TIMELESS | BOLD | SUBTLE
+  // (Legacy „DISPLAY" wird wie MODERN behandelt).
+  headerFont      String  @default("MODERN")
+  headerButton    String  @default("UNDER")  // UNDER | BOTTOM | HIDDEN
+  headerTextColor String? // Hex (z.B. "#ffffff"); null = automatisch (weiß auf Cover, Ink sonst)
+
+  // Theme der Galerie: AUTO (OS-Einstellung) | LIGHT | DARK; optionale eigene
+  // Hintergrundfarbe (Hex, z.B. "#efece5"); null = Standard.
+  themeMode String  @default("AUTO")
+  bgColor   String?
+
+  // Aufnahme-Metadaten (EXIF) in der Lightbox anzeigen? Opt-in: standardmäßig aus.
+  showExif Boolean @default(false)
+
+  ownerId String
+  owner   Admin  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  photos        Photo[]        @relation("AlbumPhotos")
+  comments      Comment[]
+  accessLogs    AccessAttempt[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------------
+// Photo
+// ---------------------------------------------------------------------------
+
+model Photo {
+  id      String @id @default(cuid())
+  albumId String
+  album   Album  @relation("AlbumPhotos", fields: [albumId], references: [id], onDelete: Cascade)
+
+  // Storage: Basis-Key im Filesystem / S3. Aus dem Key werden die Varianten
+  // abgeleitet (z.B. <key>.webp, <key>_thumb.webp) — von sharp beim Upload erzeugt.
+  storageKey  String  @unique
+  originalName String
+  mimeType    String
+  sizeBytes   Int
+
+  // Herunterladbares Original (Quelldatei, die beim Upload erhalten bleibt)
+  originalKey       String? // Storage-Key der unveränderten Quelldatei
+  originalMime      String?
+  originalSizeBytes Int?
+
+  // Optionale RAW-Begleitdatei (zum Weitergeben; nicht webfähig)
+  rawKey       String?
+  rawName      String?
+  rawSizeBytes Int?
+
+  // Bilddimensionen des Originals (für Layout ohne Nachladen / CLS-Vermeidung)
+  width  Int
+  height Int
+
+  // Winzige Base64-Vorschau (BlurHash / blurDataURL) für Skeleton-Übergänge
+  blurDataUrl String?
+
+  // Ausgewählte EXIF-Aufnahmedaten (Kamera, ISO, Brennweite …) für die Anzeige
+  exif Json?
+
+  // Redaktionelle Metadaten
+  caption    String?
+  // Galerie-Gruppe: gruppiert Bilder INNERHALB eines Albums (z.B. Outfits oder
+  // Vorbereitung/Trauung/Feier). Steuert die Tab-Filter in der Kundengalerie.
+  // Hat NICHTS mit der Portfolio-Kategorie zu tun.
+  category   String?
+  // Portfolio-Kategorie (Genre) dieses Bildes — überschreibt für Mischalben die
+  // Album-Kategorie. Effektiv fürs Portfolio: portfolioCategory ?? album.category.
+  portfolioCategory String?
+  isKeyVisual Boolean @default(false) // im Layout hervorheben
+  isFavorite Boolean @default(false)  // vom Admin favorisiert (Portfolio-Kuratierung)
+
+  // Fokuspunkt für die Cover-Darstellung (object-position in %) — PRO Bild
+  // gespeichert, damit jedes potenzielle Cover seinen eigenen Bildausschnitt
+  // behält. 50/50 = zentriert (Default).
+  focusX Int @default(50)
+  focusY Int @default(50)
+  isPublic   Boolean @default(false)  // für den Seitenbereich freigegeben (Mediathek → Blöcke)
+
+  // Platzhalter-Bilder aus einer externen Quelle (aktuell "unsplash"), geladen
+  // um leere Alben/Startseiten zu befüllen. Gesetzt = Demo-Bild: überall
+  // erkennbar und sammelweise ausblendbar/löschbar. `demoCredit` hält den
+  // Fotografennamen — die Unsplash-Richtlinien verlangen die Nennung.
+  demoSource String?
+  demoCredit String?
+
+  // Medientyp: IMAGE (Standard) | VIDEO. Bei VIDEO liegt unter storageKey.webp
+  // das (clientseitig erzeugte) Poster-Standbild, `originalKey` ist die
+  // abspielbare Videodatei (video/mp4|webm). `durationMs` = Länge in ms.
+  mediaType  String @default("IMAGE")
+  durationMs Int?
+  sortOrder  Int      @default(0)     // manuelle Drag-&-Drop-Reihenfolge
+  takenAt    DateTime?               // aus EXIF (GPS wird beim Upload entfernt)
+
+  // Soft-Delete: gesetzt = im Papierkorb (für „Rückgängig"). Die Dateien bleiben
+  // erhalten, bis der Purge sie endgültig entfernt. Alle sichtbaren Listen
+  // filtern auf `deletedAt: null`.
+  deletedAt DateTime?
+
+  comments  Comment[]
+  reactions Reaction[]
+
+  // Gegenrichtung der Cover-Relation
+  coverOfAlbum Album? @relation("AlbumCover")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([albumId, sortOrder])
+  @@index([albumId, deletedAt])
+  @@index([albumId, isFavorite])
+  @@index([demoSource])
+}
+
+// ---------------------------------------------------------------------------
+// Gäste-Interaktion: Kommentare & Reaktionen
+// ---------------------------------------------------------------------------
+
+/// Kommentar eines Gastes. Kann an einem einzelnen Foto ODER am Album hängen.
+model Comment {
+  id        String  @id @default(cuid())
+  body      String
+  guestName String? // optional abgefragt oder generiert
+  guestId   String  // anonyme Session-/Cookie-ID zur Zuordnung
+  isHidden  Boolean @default(false) // Moderation durch Admin
+
+  photoId String?
+  photo   Photo?  @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  albumId String?
+  album   Album?  @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([photoId])
+  @@index([albumId])
+}
+
+enum ReactionType {
+  HEART   // einfaches Like
+  STAR    // 1-5 Sterne-Bewertung (value nutzen)
+}
+
+/// Reaktion eines Gastes auf ein Foto. Pro Gast + Foto genau eine Reaktion
+/// (Toggle/Update), erzwungen durch den zusammengesetzten Unique-Index.
+model Reaction {
+  id      String       @id @default(cuid())
+  type    ReactionType @default(HEART)
+  value   Int          @default(1) // bei STAR: 1..5, bei HEART: 1
+  guestId String                    // anonyme Session-/Cookie-ID
+
+  photoId String
+  photo   Photo  @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([photoId, guestId])
+  @@index([photoId])
+}
+
+// ---------------------------------------------------------------------------
+// Sicherheit: Brute-Force-Schutz für Album-Passwörter
+// ---------------------------------------------------------------------------
+
+/// Protokolliert Passwort-Versuche pro Album/IP für Rate-Limiting & Lockout.
+model AccessAttempt {
+  id        String   @id @default(cuid())
+  albumId   String
+  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  ipHash    String   // gehashte IP (Datenschutz)
+  success   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([albumId, ipHash, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Website-Builder: Seiten (Block-System) & globale Theme-Einstellung
+// ---------------------------------------------------------------------------
+
+/// Eine baubare Portfolio-Seite. Der Inhalt liegt komplett als strukturiertes
+/// JSON in `blocks` — ein Array von { id, type, data }. Die JSON-Struktur ist
+/// theme-agnostisch: sie beschreibt NUR Inhalt/Struktur, nie Darstellung.
+/// Gerendert wird sie vom <BlockRenderer> mit dem aktiven Theme aus SiteSettings.
+model Page {
+  id    String @id @default(cuid())
+  title String
+  slug  String // menschenlesbarer Pfadteil (pro Owner eindeutig)
+
+  /// Inhaltsblöcke als striktes JSON-Schema (siehe src/themes/schema.ts).
+  /// Beispiel: [{ "id": "b1", "type": "hero", "data": { "headline": "…" } }]
+  blocks Json @default("[]")
+
+  isPublished Boolean @default(false)
+
+  /// Feste System-Seiten vs. frei angelegte Seiten:
+  /// CUSTOM | HOME | IMPRINT | PRIVACY | CONTACT. System-Seiten werden je Admin
+  /// automatisch angelegt (siehe ensureSystemPages) und sind nicht löschbar.
+  /// Bewusst String (kein Enum): neue Arten ohne Migration möglich.
+  kind String @default("CUSTOM")
+
+  /// Sichtbarkeitsschalter für (System-)Seiten — z.B. Kontakt deaktivieren.
+  /// Öffentliche Auflösung filtert zusätzlich auf isEnabled.
+  isEnabled Boolean @default(true)
+
+  /// Kennzeichnet die Startseite der Website: sie wird unter der Root-Domain `/`
+  /// ausgeliefert (nicht unter `/[slug]`). Höchstens eine je Owner — erzwungen
+  /// durch einen Partial-Unique-Index in der Migration (nur DB-seitig).
+  isHome Boolean @default(false)
+
+  ownerId String
+  owner   Admin  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerId, slug]) // Slug eindeutig je Admin
+  @@index([ownerId])
+  @@index([ownerId, isHome])
+}
+
+/// Globale Einstellungen der Website eines Admins. Genau eine Zeile je Admin
+/// (erzwungen durch @unique auf ownerId). Hält u.a. das aktive Theme, dessen
+/// Identifier die Theme-Registry im Frontend auflöst.
+model SiteSettings {
+  id String @id @default(cuid())
+
+  /// Identifier des aktiven Themes (z.B. "minimal" | "editorial" | "masonry").
+  /// Bewusst String, nicht Enum: neue Themes sollen ohne Migration hinzukommen.
+  activeTheme String @default("immersive")
+
+  /// Globaler Schalter für die öffentliche Portfolio-Website. Ist er aus, zeigt
+  /// die öffentliche Route eine Platzhalterseite — unabhängig davon, ob einzelne
+  /// Seiten veröffentlicht sind.
+  portfolioEnabled Boolean @default(false)
+
+  /// Hintergrund der fixen WebGL-Startseite (FilmStrip-Theme). `startBgMode`
+  /// steuert den Kontrast der Overlays: "dark" = helle Schrift/UI auf dunklem
+  /// Grund, "light" = umgekehrt. `startBgColor` ist die konkrete Hintergrundfarbe
+  /// (Hex, auch für den Canvas-Clear-Color).
+  startBgMode  String @default("dark")
+  startBgColor String @default("#0b0b0d")
+
+  /// Grundeinstellung „Schrift": Display-Font der Startseite.
+  /// editorial (Cormorant) | serif (Fraunces) | display (Space Grotesk) | sans (Inter).
+  siteFont String @default("editorial")
+
+  /// Theme der fixen WebGL-Startseite: "reel" = FilmStrip (Standard),
+  /// "omnigrid" = unendliches, zieh-/scrollbares Bildraster. Bewusst String
+  /// (kein Enum): weitere Startseiten-Themes ohne Migration ergänzbar.
+  startTheme String @default("reel")
+
+  /// OmniGrid-spezifische Optionen (nur wirksam, wenn startTheme = "omnigrid").
+  /// `omniAutoSpeed` = Idle-Auto-Schwenk-Tempo (Welt-Einheiten/Sek, klein = subtil),
+  /// `omniShowGridLines` = minimalistische „Schneidematte" hinter den Bildern,
+  /// `omniSubtitle` = optionale Unterzeile unter der zentralen Headline.
+  /// `omniAlwaysColor` = Bilder dauerhaft farbig statt erst beim Hover.
+  omniAutoSpeed     Float   @default(0.08)
+  omniShowGridLines Boolean @default(true)
+  omniAlwaysColor   Boolean @default(false)
+  omniSubtitle      String?
+  /// `omniGap` = Zwischenraum-Anteil pro Zelle (0..1; größer = mehr Abstand,
+  /// kleinere Bilder). `omniCellSize` = Basis-Zellgröße in Weltkoordinaten
+  /// (größer = größere Bilder / stärker herangezoomt).
+  omniGap      Float @default(0.16)
+  omniCellSize Float @default(3.4)
+  /// Wie die Marke (Logo bzw. Wortmarke) auf der OmniGrid-Startseite auftritt:
+  /// "swap"  = Name steht mittig und weicht bei Bewegung dem Logo oben links
+  ///           (im Leerlauf tauschen sie zurück) — eine Marke, zwei Plätze.
+  /// "fixed" = Logo klebt dauerhaft oben links; die Mitte ist damit frei für
+  ///           eigenen Text (`omniHeadline` + `omniSubtitle`), der wie gehabt
+  ///           bei Bewegung ausblendet. Beide Felder dürfen leer bleiben.
+  omniBrandMode String  @default("swap")
+  /// Freie Headline der Mitte — NUR im Modus "fixed" genutzt; im Modus "swap"
+  /// steht dort die Wortmarke. Leer = keine Headline.
+  omniHeadline  String?
+
+  /// Inhalt der Startseite (eigener Editor, KEIN Block-Builder).
+  /// `startTitle` = optionaler Titel-Override (sonst Wortmark/Name aus Branding).
+  /// `startSource` (Legacy) — die Bildauswahl läuft jetzt über `startItems`.
+  startTitle  String?
+  startSource String  @default("albums")
+
+  /// Kuratierter Inhalt des Film-Strips: geordnetes JSON-Array aus Einträgen
+  /// { t:"album", id } | { t:"photo", k }. Volle Kontrolle im Startseite-Editor.
+  startItems Json?
+  /// Filterleiste unten (Kategorien) anzeigen?
+  startShowFilter Boolean @default(true)
+  /// Burger-Menü aktiv? Gilt global (Startseite UND Unterseiten); der Name
+  /// stammt aus der Zeit, als es das Menü nur auf der Startseite gab.
+  startMenuEnabled Boolean @default(true)
+  /// Kuratierte Menüeinträge (JSON, Schema `src/lib/menu-items.ts`):
+  /// Seiten-Verweise und freie/externe Links in frei wählbarer Reihenfolge.
+  /// NULL/leer = automatisch aus den veröffentlichten Seiten ableiten.
+  menuItems Json?
+  /// Wo die Social-Links erscheinen: "corner" = wie bisher in der Ecke der
+  /// Startseite, "menu" = als eigene Gruppe im Burger-Menü, "off" = gar nicht.
+  menuSocialsMode String @default("corner")
+  /// Welche Social-Kanäle gezeigt werden (JSON: Array von Plattform-Schlüsseln).
+  /// NULL = alle gepflegten Kanäle.
+  menuSocialKeys Json?
+
+  // ─── Identität (für Impressum, Datenschutz, Copyright) ─────────────────────
+  ownerName      String? // vollständiger Name / Studioname
+  addressStreet  String?
+  addressZip     String?
+  addressCity    String?
+  addressCountry String?
+  phone          String?
+  vatId          String? // USt-IdNr. (optional)
+  contactEmail   String? // öffentlich sichtbare Kontaktadresse (Impressum)
+
+  // ─── Branding: Logo / Namensdarstellung ────────────────────────────────────
+  /// "TEXT" = Schrift-Logo aus ownerName | "IMAGE" = hochgeladenes Logo.
+  logoType         String  @default("TEXT")
+  logoImageKey     String? // Storage-Key des Logo-Bildes (bei logoType=IMAGE)
+  /// Schreibweise des Schrift-Logos: FULL | INITIAL_LAST | LAST_ONLY | INITIALS.
+  nameDisplayStyle String  @default("FULL")
+
+  /// Social-Media-Links als JSON-Objekt (Plattform → URL). Leere/fehlende
+  /// Einträge werden im Frontend nicht gerendert.
+  socials Json?
+
+  // ─── Auffindbarkeit / SEO ──────────────────────────────────────────────────
+  /// Titel im Browser-Tab und in Suchergebnissen. Leer = Wortmarke aus `ownerName`.
+  seoTitle       String?
+  /// Meta-Beschreibung (Snippet in Suchergebnissen und Link-Vorschauen).
+  seoDescription String?
+  /// Sollen Suchmaschinen die Website aufnehmen? false = `noindex, nofollow` +
+  /// robots.txt sperrt alles. Wirkt NUR auf den öffentlichen Bereich — Galerie-
+  /// Links (/a/…) und /admin sind unabhängig davon immer ausgeschlossen.
+  seoIndexable   Boolean @default(true)
+  /// Favicon (Storage-Key, PNG 256px). Leer = Browser-Standardsymbol.
+  faviconKey     String?
+  /// Vorschaubild für geteilte Links (Open Graph, 1200×630 JPEG).
+  ogImageKey     String?
+
+  // ─── Kontaktformular-Ziel ───────────────────────────────────────────────────
+  /// Postfach, an das Kontaktformular-Einsendungen gehen. Fällt bei leer auf
+  /// `mailFrom` zurück. Ersetzt die frühere Empfänger-pro-Block-Konfiguration.
+  contactRecipient String?
+
+  /// SMTP-Zugang für den Versand der Kontaktformular-Einsendungen. Im Backend
+  /// pflegbar (nicht per env). Das Passwort liegt AES-GCM-verschlüsselt in
+  /// `smtpPassEnc` (siehe src/lib/secret-box.ts) — nie im Klartext, nie an den Client.
+  smtpHost    String?
+  smtpPort    Int?
+  smtpSecure  Boolean @default(false) // true = implizites TLS (Port 465), false = STARTTLS (587)
+  smtpUser    String?
+  smtpPassEnc String? // verschlüsseltes Passwort (iv:tag:ciphertext, base64)
+  mailFrom    String? // Absenderadresse
+  mailFromName String? // optionaler Absender-Anzeigename
+
+  ownerId String @unique
+  owner   Admin  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

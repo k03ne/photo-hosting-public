@@ -1,0 +1,128 @@
+name: Deploy (Docker Compose) | main
+
+# HINWEIS: Der push-Trigger ist vorübergehend deaktiviert, weil der Docker-Build
+# auf dem Server aktuell klemmt. Aktiv ist stattdessen der native pm2-Deploy
+# (.github/workflows/deploy-native.yml). Docker bleibt das langfristige Ziel:
+# Sobald es wieder baut, hier den push-Trigger reaktivieren (siehe unten) und in
+# deploy-native.yml den push-Trigger entfernen. Bis dahin lässt sich dieser
+# Workflow weiterhin manuell über "Run workflow" (workflow_dispatch) starten.
+#
+# Baut die App auf dem Zielserver per Docker Compose neu und startet sie.
+# Datenbank-Migrationen (prisma migrate deploy) + Admin-Seed laufen automatisch
+# im Container-Entrypoint (docker-entrypoint.sh) vor dem App-Start.
+#
+# Konfigurationswerte (Admin, Postgres, AUTH_SECRET, NEXT_PUBLIC_APP_URL, …)
+# kommen aus der .env-Datei IM DEPLOY-VERZEICHNIS auf dem Server. Diese wird
+# manuell gepflegt und vom Workflow NICHT verändert (sie ist gitignored, ein
+# `git reset --hard` fasst sie nicht an).
+#
+# Benötigte GitHub-Secrets (Settings → Secrets and variables → Actions):
+#   SSH_HOST     Server-Hostname/IP
+#   SSH_USER     SSH-Benutzer
+#   SSH_KEY      privater SSH-Schlüssel (PEM)
+#   GIT_REMOTE   z.B. github.com/OWNER/photo-hosting.git
+#                (nötig für den Erstlauf — der Workflow klont/initialisiert selbst)
+#   GH_PAT       GitHub-PAT mit repo-Leserecht (nur bei privatem Repo nötig)
+#   DEPLOY_PATH  Zielverzeichnis auf dem Server (PFLICHT, absoluter Pfad,
+#                z.B. /srv/meine-domain.de). Steht bewusst nicht im Repo.
+
+on:
+  # push:            # ← vorübergehend deaktiviert (siehe Kommentar oben).
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+# Parallele Deploys desselben Branches vermeiden.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.2.0
+        # Secrets ins Runner-Environment mappen — nur so kann ssh-action sie
+        # über `envs:` an das Remote-Skript weiterreichen.
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GIT_REMOTE: ${{ secrets.GIT_REMOTE }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: DEPLOY_PATH,GIT_REMOTE,GH_PAT
+          script: |
+            set -e
+
+            # Kein geratener Fallback — siehe deploy-native.yml.
+            APP_DIR="$DEPLOY_PATH"
+            if [ -z "$APP_DIR" ]; then
+              echo "FEHLER: Secret DEPLOY_PATH ist nicht gesetzt."
+              exit 1
+            fi
+
+            # Repo-URL bestimmen. GIT_REMOTE darf "owner/repo",
+            # "owner/repo.git" oder "github.com/owner/repo.git" sein — wird
+            # normalisiert (Host + .git ergänzt), damit git nicht "owner" als
+            # Hostname interpretiert.
+            if [ -n "$GIT_REMOTE" ]; then
+              REMOTE="$GIT_REMOTE"
+              REMOTE="${REMOTE#https://}"      # evtl. mitgegebenes Protokoll weg
+              REMOTE="${REMOTE#http://}"
+              case "$REMOTE" in
+                github.com/*) : ;;            # Host bereits vorhanden
+                */*/*)       : ;;            # anderer Host mit owner/repo
+                */*)         REMOTE="github.com/$REMOTE" ;;  # nur owner/repo
+              esac
+              case "$REMOTE" in
+                *.git) : ;;
+                *)     REMOTE="${REMOTE}.git" ;;
+              esac
+              if [ -n "$GH_PAT" ]; then
+                REPO_URL="https://${GH_PAT}@${REMOTE}"
+              else
+                REPO_URL="https://${REMOTE}"
+              fi
+            else
+              REPO_URL=""
+            fi
+
+            echo "→ Code aktualisieren…"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "  Kein Git-Repo in $APP_DIR — initialisiere (Erstlauf)…"
+              if [ -z "$REPO_URL" ]; then
+                echo "  FEHLER: Secrets GIT_REMOTE (und ggf. GH_PAT) für den Erstklon setzen."
+                exit 1
+              fi
+              mkdir -p "$APP_DIR"
+              cd "$APP_DIR"
+              git init -q
+              git remote add origin "$REPO_URL"
+            else
+              cd "$APP_DIR"
+              if [ -n "$REPO_URL" ]; then
+                git remote set-url origin "$REPO_URL"
+              fi
+            fi
+
+            git fetch --all --prune
+            git reset --hard origin/main
+
+            # .env muss auf dem Server liegen (Admin/Postgres/AUTH_SECRET/…).
+            # Bricht früh ab, damit die App nicht mit unsicheren Compose-Defaults startet.
+            if [ ! -f "$APP_DIR/.env" ]; then
+              echo "  FEHLER: $APP_DIR/.env fehlt. Bitte anhand von .env.example anlegen."
+              exit 1
+            fi
+
+            echo "→ Container bauen & starten (Migrationen laufen im Entrypoint)…"
+            docker compose pull db
+            docker compose up -d --build
+
+            echo "→ Alte Images aufräumen…"
+            docker image prune -f
+
+            echo "✓ Deploy abgeschlossen."

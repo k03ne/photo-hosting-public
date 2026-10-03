@@ -1,0 +1,179 @@
+name: Deploy (nativ / pm2) | main
+
+# WORKAROUND-Deploy: baut & startet die App NATIV per pm2 auf dem Zielserver,
+# ohne den App-Container zu bauen (der Docker-Build klemmt aktuell auf dem
+# ressourcenarmen Server). Die Datenbank bleibt der bestehende Docker-Container
+# (nur der `db`-Service wird gestartet).
+#
+# Docker bleibt das langfristige Ziel: deploy.yml (Docker-Compose) ist weiterhin
+# vorhanden, aber vorübergehend auf manuellen Start (workflow_dispatch)
+# umgestellt, damit nicht bei jedem Push ZWEI Deploys laufen. Zum Zurückwechseln
+# einfach den push-Trigger dort wieder aktivieren und hier deaktivieren.
+#
+# MEHRERE INSTANZEN: derselbe Code läuft in mehreren Ordnern auf demselben
+# Server (Matrix unten), jeder mit eigener .env → eigener pm2-Prozess, eigener
+# Port und eigener Datenbank-Container. Getrennt wird ausschließlich über die
+# .env des Ordners (PM2_APP_NAME, PORT, COMPOSE_PROJECT_NAME, DB_PORT,
+# DATABASE_URL, AUTH_SECRET, NEXT_PUBLIC_APP_URL, ADMIN_*) — im Repo gibt es
+# KEINE instanzspezifischen Dateien.
+#
+# `max-parallel: 1`, weil der Server knapp ist: zwei gleichzeitige `next build`
+# bringen ihn ans Speicher-/Prozesslimit.
+#
+# Benötigte GitHub-Secrets (identisch zu deploy.yml):
+#   SSH_HOST, SSH_USER, SSH_KEY, GIT_REMOTE, GH_PAT (privat),
+#   DEPLOY_PATH (PFLICHT, Zielordner Instanz 1),
+#   DEPLOY_PATH_2 (nur falls eine zweite Instanz betrieben wird)
+#
+# Voraussetzungen auf dem Server (je Instanz-Ordner):
+#   - Node.js 22 + npm installiert
+#   - Docker (für den db-Container)
+#   - .env im Ordner (wie beim Docker-Deploy, gitignored)
+#   - pm2 (wird sonst vom Skript global installiert)
+#   - Reverse-Proxy der Domain zeigt auf den PORT der Instanz
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      # Eine kaputte Instanz soll die andere nicht mit abbrechen.
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        instance:
+          # Die Zielordner stehen bewusst NICHT im Repo, sondern in Secrets —
+          # das Repo ist öffentlich und soll die Serverstruktur nicht nennen.
+          # Jede Instanz braucht ihr Pfad-Secret (absoluter Pfad auf dem Server,
+          # z. B. /srv/meine-domain.de). Fehlt es, bricht der Lauf ab.
+          - label: Instanz 1
+            path_secret: DEPLOY_PATH
+            # Fehlende .env ist hier ein Fehler — die Instanz gibt es schon.
+            required: "true"
+          - label: Instanz 2
+            path_secret: DEPLOY_PATH_2
+            # Noch nicht eingerichtet? Dann überspringen statt den Lauf rot zu
+            # machen — die erste Instanz soll trotzdem deployen.
+            required: "false"
+    name: Deploy ${{ matrix.instance.label }}
+    # Sicherheitsnetz, falls die SSH-Session hängt statt sauber zu enden.
+    timeout-minutes: 90
+    steps:
+      - name: Deploy to server (native / pm2)
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ secrets[matrix.instance.path_secret] }}
+          INSTANCE_REQUIRED: ${{ matrix.instance.required }}
+          GIT_REMOTE: ${{ secrets.GIT_REMOTE }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          # Default wären 10m — das reicht hier nicht: npm ci läuft bewusst
+          # gedrosselt (MAXSOCKETS=1, --foreground-scripts) und `next build` mit
+          # einem Worker, weil der Server sonst ans Prozesslimit stößt. Ein
+          # Erstlauf (frischer Klon, leerer npm-Cache, sharp-Install) braucht
+          # deutlich länger. Ohne diesen Wert kappt die Action die SSH-Session
+          # mitten im laufenden Deploy.
+          command_timeout: 60m
+          envs: DEPLOY_PATH,INSTANCE_REQUIRED,GIT_REMOTE,GH_PAT
+          script: |
+            set -e
+
+            # Kein Fallback-Pfad im Repo: ohne Secret wissen wir nicht, wohin
+            # deployt werden soll — in einen geratenen Ordner zu schreiben wäre
+            # die schlechtere Fehlerrichtung.
+            #
+            # Fehlt das Secret, hängt die Reaktion an `required`: eine bereits
+            # bestehende Instanz ist dann ein echter Fehler, eine optionale
+            # (noch nicht eingerichtete) wird übersprungen — sonst macht eine
+            # unfertige zweite Site den Lauf rot und blockiert die erste.
+            APP_DIR="$DEPLOY_PATH"
+            if [ -z "$APP_DIR" ]; then
+              if [ "$INSTANCE_REQUIRED" != "true" ]; then
+                echo "  Übersprungen: Pfad-Secret nicht gesetzt (Instanz noch nicht eingerichtet)."
+                exit 0
+              fi
+              echo "FEHLER: Pfad-Secret für diese Instanz ist nicht gesetzt."
+              echo "  In GitHub → Settings → Secrets den absoluten Zielordner"
+              echo "  auf dem Server hinterlegen (DEPLOY_PATH bzw. DEPLOY_PATH_2)."
+              exit 1
+            fi
+            echo "→ Instanz: $APP_DIR"
+
+            # Optionale Instanz ohne .env = noch nicht eingerichtet. Vor dem
+            # Klonen prüfen, damit kein halb fertiger Ordner zurückbleibt.
+            if [ "$INSTANCE_REQUIRED" != "true" ] && [ ! -f "$APP_DIR/.env" ]; then
+              echo "  Übersprungen: $APP_DIR/.env fehlt (Instanz noch nicht eingerichtet)."
+              echo "  Zum Aktivieren: Ordner anlegen, .env aus .env.example ableiten"
+              echo "  (eigene PM2_APP_NAME, PORT, COMPOSE_PROJECT_NAME, DB_PORT,"
+              echo "  DATABASE_URL, AUTH_SECRET, NEXT_PUBLIC_APP_URL, ADMIN_*)."
+              exit 0
+            fi
+
+            # Repo-URL bestimmen (Normalisierung wie im Docker-Deploy):
+            # GIT_REMOTE darf "owner/repo", "owner/repo.git" oder
+            # "github.com/owner/repo.git" sein.
+            if [ -n "$GIT_REMOTE" ]; then
+              REMOTE="$GIT_REMOTE"
+              REMOTE="${REMOTE#https://}"
+              REMOTE="${REMOTE#http://}"
+              case "$REMOTE" in
+                github.com/*) : ;;
+                */*/*)       : ;;
+                */*)         REMOTE="github.com/$REMOTE" ;;
+              esac
+              case "$REMOTE" in
+                *.git) : ;;
+                *)     REMOTE="${REMOTE}.git" ;;
+              esac
+              if [ -n "$GH_PAT" ]; then
+                REPO_URL="https://${GH_PAT}@${REMOTE}"
+              else
+                REPO_URL="https://${REMOTE}"
+              fi
+            else
+              REPO_URL=""
+            fi
+
+            echo "→ Code aktualisieren…"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "  Kein Git-Repo in $APP_DIR — initialisiere (Erstlauf)…"
+              if [ -z "$REPO_URL" ]; then
+                echo "  FEHLER: Secrets GIT_REMOTE (und ggf. GH_PAT) für den Erstklon setzen."
+                exit 1
+              fi
+              mkdir -p "$APP_DIR"
+              cd "$APP_DIR"
+              git init -q
+              git remote add origin "$REPO_URL"
+            else
+              cd "$APP_DIR"
+              if [ -n "$REPO_URL" ]; then
+                git remote set-url origin "$REPO_URL"
+              fi
+            fi
+
+            git fetch --all --prune
+            git reset --hard origin/main
+
+            # .env muss auf dem Server liegen (Admin/Postgres/AUTH_SECRET/…).
+            if [ ! -f "$APP_DIR/.env" ]; then
+              echo "  FEHLER: $APP_DIR/.env fehlt. Bitte anhand von .env.example anlegen."
+              exit 1
+            fi
+
+            echo "→ Nativen Deploy ausführen (db-Container, npm ci, migrate, build, pm2)…"
+            bash scripts/deploy-native.sh "$APP_DIR"
+
+            echo "✓ Deploy abgeschlossen."

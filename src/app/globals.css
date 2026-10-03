@@ -1,0 +1,166 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Hell — klares, kühles Neutral; die Fotos tragen die Farbe */
+    --canvas: 0 0% 99%;
+    --surface: 0 0% 100%;
+    --ink: 0 0% 11%;
+    --muted: 0 0% 46%;
+    --line: 0 0% 91%;
+    /* Monochrom: Akzent == Ink (keine bunte Akzentfarbe) */
+    --accent: 0 0% 11%;
+    --accent-ink: 0 0% 100%;
+  }
+
+  .dark {
+    --canvas: 0 0% 5%;
+    --surface: 0 0% 8%;
+    --ink: 0 0% 95%;
+    --muted: 0 0% 60%;
+    --line: 0 0% 16%;
+    --accent: 0 0% 95%;
+    --accent-ink: 0 0% 7%;
+  }
+
+  /* Pro-Album erzwungenes Theme (überschreibt die globale OS-/Toggle-Wahl im
+     jeweiligen Teilbaum). */
+  .force-light {
+    --canvas: 0 0% 99%;
+    --surface: 0 0% 100%;
+    --ink: 0 0% 11%;
+    --muted: 0 0% 46%;
+    --line: 0 0% 91%;
+    --accent: 0 0% 11%;
+    --accent-ink: 0 0% 100%;
+  }
+
+  .force-dark {
+    --canvas: 0 0% 5%;
+    --surface: 0 0% 8%;
+    --ink: 0 0% 95%;
+    --muted: 0 0% 60%;
+    --line: 0 0% 16%;
+    --accent: 0 0% 95%;
+    --accent-ink: 0 0% 7%;
+  }
+
+  * {
+    border-color: hsl(var(--line));
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+
+  body {
+    background: hsl(var(--canvas));
+    color: hsl(var(--ink));
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  ::selection {
+    background: hsl(var(--ink) / 0.12);
+  }
+}
+
+@layer components {
+  .input {
+    @apply w-full rounded-xl border bg-surface px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-muted/70 focus:border-accent focus:ring-4 focus:ring-accent/15;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition disabled:opacity-55;
+  }
+  .btn-primary {
+    @apply btn bg-ink text-canvas hover:opacity-90;
+  }
+  .btn-accent {
+    @apply btn bg-accent text-[hsl(var(--accent-ink))] hover:brightness-105;
+  }
+  .btn-ghost {
+    @apply btn border bg-surface text-ink hover:border-muted/50;
+  }
+  .btn-danger {
+    @apply btn border border-red-400/40 text-red-500 hover:bg-red-500/10;
+  }
+
+  .card {
+    @apply rounded-2xl border bg-surface;
+  }
+
+  .label {
+    @apply text-sm font-medium text-ink;
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+}
+
+/* Solange im Admin eine Kachel gezogen wird (Klasse wird von `PhotoManager`
+   gesetzt): Zeiger bleibt überall „grabbing". Ohne das wechselt er ständig,
+   sobald der Zeiger die Kachel verlässt — in die Rasterlücken, über Buttons
+   oder Text —, obwohl der Ziehvorgang unverändert weiterläuft. `!important`
+   ist hier nötig, weil es die Cursor-Utilities der überfahrenen Elemente
+   überstimmen muss. */
+body.dnd-dragging,
+body.dnd-dragging * {
+  cursor: grabbing !important;
+}
+
+/* Textauswahl beim Ziehen unterdrücken — sonst markiert der Zug nebenbei
+   Beschriftungen im Umfeld des Rasters. */
+body.dnd-dragging {
+  user-select: none;
+}
+
+/* PhotoSwipe: eingebaute Buttons (Schließen, Zoom, Pfeile) als Outline-Icons,
+   passend zum übrigen Icon-Set. Höhere Spezifität (.pswp__icn.pswp-outline)
+   schlägt PhotoSwipes eigenes `fill`. Drop-Shadow für Kontrast auf hellen
+   Bildern. */
+.pswp__icn.pswp-outline {
+  fill: none;
+  stroke: var(--pswp-icon-color, #fff);
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
+}
+
+/* Die Pfeil-Buttons rendern das Icon auf 60px (statt 32px wie Schließen/Zoom),
+   dadurch wirkt derselbe Strich dicker. Dünner zeichnen, damit die Pfeile zum
+   restlichen Icon-Set passen. */
+.pswp__button--arrow .pswp__icn.pswp-outline {
+  stroke-width: 1;
+}
+
+/* PhotoSwipe spiegelt den „Weiter"-Pfeil per Default (scale(-1,1)) und geht dabei
+   von einem nach links zeigenden Standard-Icon aus. Unser Icon zeigt bereits nach
+   rechts – die Spiegelung zurücknehmen. */
+.pswp__button--arrow--next .pswp__icn.pswp-outline {
+  transform: none;
+}
+
+/* Slideshow/Autoplay: sämtliche Bedienelemente ausblenden, nur das Bild bleibt. */
+.pswp--slideshow .pswp__button,
+.pswp--slideshow .pswp__counter {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
+/* Der Hintergrund liegt sonst bei bgOpacity 0.92 — die Galerie schimmert durch
+   und zappelt bei jedem Bildwechsel mit. In der Diashow deshalb voll deckend.
+   PhotoSwipe setzt die Deckkraft per Inline-Style, daher `!important` (eine
+   wichtige Regel im Stylesheet schlägt ein Inline-`style` ohne `!important`). */
+.pswp--slideshow .pswp__bg {
+  opacity: 1 !important;
+}

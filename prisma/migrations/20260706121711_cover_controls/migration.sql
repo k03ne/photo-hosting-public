@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Album" ADD COLUMN     "coverBlur" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "coverOverlay" INTEGER NOT NULL DEFAULT 25;
